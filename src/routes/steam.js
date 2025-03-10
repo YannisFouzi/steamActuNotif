@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const steamService = require("../services/steamService");
+const gamesSyncService = require("../services/gamesSyncService");
 const User = require("../models/User");
 
 // Jeux populaires qui auront des timestamps manuels pour les tests
@@ -10,207 +11,166 @@ const TEST_GAMES_WITH_UPDATES = {
   440: { name: "Team Fortress 2", timestamp: Date.now() - 86400000 }, // Mis à jour il y a 24 heures
 };
 
-// Récupérer les jeux d'un utilisateur Steam
+// Route pour récupérer la liste des jeux d'un utilisateur
 router.get("/games/:steamId", async (req, res) => {
-  console.log(`Requête reçue pour le SteamID: ${req.params.steamId}`);
-  try {
-    const { steamId } = req.params;
+  const { steamId } = req.params;
 
-    // Valider le SteamID
-    if (!steamId || steamId.length < 10) {
-      return res.status(400).json({ message: "SteamID invalide" });
+  try {
+    console.log(`Demande de jeux pour l'utilisateur ${steamId}`);
+
+    // Vérifier que le steamId est valide
+    if (!steamId || steamId.length < 5) {
+      return res.status(400).json({
+        status: "error",
+        message: "SteamID invalide",
+      });
     }
 
-    // Récupérer l'utilisateur pour obtenir les informations sur les jeux suivis
+    // Récupérer l'utilisateur
     const user = await User.findOne({ steamId });
 
-    // Récupérer les jeux
+    if (!user) {
+      console.log(`Utilisateur ${steamId} non trouvé dans la base de données`);
+    } else {
+      console.log(
+        `Utilisateur ${user.username} trouvé, possède ${user.ownedGames.length} jeux en base`
+      );
+    }
+
+    // Vérifier si l'utilisateur a des jeux en attente
+    if (user && user.pendingNewGames && user.pendingNewGames.length > 0) {
+      // Synchroniser les jeux en attente
+      const syncResult = await gamesSyncService.syncPendingGamesForUser(
+        user._id
+      );
+      console.log(
+        `${syncResult.processedGames.length} jeux en attente synchronisés pour ${user.steamId}`
+      );
+    }
+
+    // Récupérer la liste des jeux depuis l'API Steam
+    console.log(`Récupération des jeux depuis l'API Steam pour ${steamId}`);
     const games = await steamService.getUserGames(steamId);
+    console.log(`API Steam a retourné ${games.length} jeux pour ${steamId}`);
 
-    // Identifiez Split Fiction et assurez-vous qu'il est traité en priorité
-    const splitFictionIndex = games.findIndex(
-      (game) => game.name === "Split Fiction"
-    );
-    if (splitFictionIndex !== -1 && splitFictionIndex >= 50) {
-      console.log(
-        "Split Fiction trouvé à l'index",
-        splitFictionIndex,
-        "- Traitement prioritaire"
-      );
-      const splitFiction = games[splitFictionIndex];
-      // Déplacer Split Fiction dans les 50 premiers jeux pour s'assurer qu'il est traité
-      games.splice(splitFictionIndex, 1);
-      games.unshift(splitFiction);
-    }
-
-    // Traitement des jeux en plusieurs lots pour éviter de surcharger l'API et améliorer les performances
-    const BATCH_SIZE = 50; // Taille de chaque lot
-    const batches = [];
-
-    // Diviser les jeux en lots
-    for (let i = 0; i < games.length; i += BATCH_SIZE) {
-      batches.push(games.slice(i, i + BATCH_SIZE));
-    }
-
-    console.log(
-      `Traitement de ${games.length} jeux en ${batches.length} lots de ${BATCH_SIZE} jeux maximum`
-    );
-
-    // Fonction pour traiter un lot de jeux
-    const processGameBatch = async (gameBatch, batchIndex) => {
-      console.log(
-        `Traitement du lot ${batchIndex + 1}/${batches.length} (${
-          gameBatch.length
-        } jeux)`
+    // Vérification de cohérence avec la base de données
+    if (user && games.length < user.ownedGames.length * 0.9) {
+      // Si moins de 90% des jeux connus
+      console.warn(
+        `ATTENTION: L'API Steam a retourné seulement ${games.length} jeux alors que ${user.ownedGames.length} sont connus dans la base`
       );
 
-      const formattedGamesPromises = gameBatch.map(async (game) => {
+      // Récupérer les jeux depuis la base de données
+      console.log(
+        `Utilisation des données de la base pour enrichir la réponse...`
+      );
+
+      // Créer un Map des jeux de l'API pour une recherche rapide
+      const apiGamesMap = new Map();
+      games.forEach((game) => {
+        apiGamesMap.set(game.appid.toString(), game);
+      });
+
+      // Chercher les jeux dans d'autres sources comme steamDB
+      console.log(
+        "Base de données contient plus de jeux que l'API, enrichissement possible requis."
+      );
+    }
+
+    // Inclure les informations de dernières actualités pour les jeux suivis
+    if (user && user.followedGames) {
+      // Créer une map des jeux suivis pour un accès rapide
+      const followedGamesMap = new Map();
+      user.followedGames.forEach((followedGame) => {
+        followedGamesMap.set(followedGame.appId, followedGame);
+      });
+
+      // Enrichir chaque jeu avec les informations de suivi
+      const enrichedGames = games.map((game) => {
         const appId = game.appid.toString();
+        const followedGame = followedGamesMap.get(appId);
 
-        // Vérifier si ce jeu est dans la liste des jeux suivis pour récupérer lastUpdateTimestamp
-        let lastUpdateTimestamp = 0;
-        if (user && user.followedGames) {
-          const followedGame = user.followedGames.find(
-            (g) => g.appId === appId
-          );
-          if (followedGame && followedGame.lastUpdateTimestamp) {
-            lastUpdateTimestamp = followedGame.lastUpdateTimestamp;
-          }
+        // Ajouter les informations de suivi si le jeu est suivi
+        if (followedGame) {
+          return {
+            ...game,
+            isFollowed: true,
+            lastNewsTimestamp: followedGame.lastNewsTimestamp || 0,
+            lastUpdateTimestamp: followedGame.lastUpdateTimestamp || 0,
+          };
         }
 
-        // Récupérer les actualités récentes pour ce jeu
-        try {
-          const news = await steamService.getGameNews(appId, 1);
-          if (news && news.length > 0) {
-            // Utiliser la date de la dernière actualité comme timestamp
-            const latestNewsDate = news[0].date * 1000; // Convertir de secondes en millisecondes
-            if (latestNewsDate > 0) {
-              lastUpdateTimestamp = latestNewsDate;
-              console.log(
-                `Actualité trouvée pour ${game.name}: ${new Date(
-                  lastUpdateTimestamp
-                ).toLocaleString()}`
-              );
-            }
-          }
-        } catch (error) {
-          console.error(
-            `Erreur lors de la récupération des actualités pour ${appId}:`,
-            error.message
-          );
-        }
-
+        // Jeu non suivi
         return {
-          appId,
-          name: game.name,
-          logoUrl: game.img_logo_url
-            ? `http://media.steampowered.com/steamcommunity/public/images/apps/${game.appid}/${game.img_logo_url}.jpg`
-            : null,
-          iconUrl: game.img_icon_url
-            ? `http://media.steampowered.com/steamcommunity/public/images/apps/${game.appid}/${game.img_icon_url}.jpg`
-            : null,
-          playtime: {
-            forever: game.playtime_forever || 0,
-            recent: game.playtime_2weeks || 0,
-          },
-          lastUpdateTimestamp,
+          ...game,
+          isFollowed: false,
+          lastNewsTimestamp: 0,
+          lastUpdateTimestamp: 0,
         };
       });
 
-      return Promise.all(formattedGamesPromises);
-    };
-
-    // Traiter le premier lot immédiatement pour une réponse rapide
-    const firstBatchGames = await processGameBatch(batches[0], 0);
-
-    // Traiter le reste des lots en arrière-plan et les stocker en cache pour les prochaines requêtes
-    if (batches.length > 1) {
-      // On n'attend pas que ce traitement se termine pour renvoyer la réponse
-      (async () => {
-        try {
-          console.log(
-            "Lancement du traitement des lots restants en arrière-plan"
-          );
-
-          // Utiliser un objet global pour stocker les résultats (simple cache en mémoire)
-          if (!global.gameNewsCache) {
-            global.gameNewsCache = {};
-          }
-
-          // Traiter les lots restants
-          for (let i = 1; i < batches.length; i++) {
-            const batchGames = await processGameBatch(batches[i], i);
-
-            // Stocker les résultats dans le cache
-            batchGames.forEach((game) => {
-              if (game.lastUpdateTimestamp > 0) {
-                global.gameNewsCache[game.appId] = {
-                  timestamp: game.lastUpdateTimestamp,
-                  updated: Date.now(),
-                };
-              }
-            });
-
-            // Pause entre les lots pour éviter de surcharger l'API
-            if (i < batches.length - 1) {
-              await new Promise((resolve) => setTimeout(resolve, 1000));
-            }
-          }
-
-          console.log(
-            "Traitement de tous les lots terminé et cache mis à jour"
-          );
-        } catch (error) {
-          console.error(
-            "Erreur lors du traitement des lots en arrière-plan:",
-            error
-          );
-        }
-      })();
+      return res.json({
+        status: "success",
+        games: enrichedGames,
+        totalGames: enrichedGames.length,
+        storedGamesCount: user.ownedGames.length,
+        apiResponse: enrichedGames.length,
+      });
     }
 
-    // Formater tous les jeux, en utilisant les données du cache si disponibles
-    const formattedGames = games.map((game) => {
-      const appId = game.appid.toString();
-
-      // Chercher d'abord dans le premier lot déjà traité
-      const processedGame = firstBatchGames.find((g) => g.appId === appId);
-      if (processedGame) {
-        return processedGame;
-      }
-
-      // Sinon, vérifier dans le cache global
-      let lastUpdateTimestamp = 0;
-      if (global.gameNewsCache && global.gameNewsCache[appId]) {
-        lastUpdateTimestamp = global.gameNewsCache[appId].timestamp;
-      } else if (user && user.followedGames) {
-        const followedGame = user.followedGames.find((g) => g.appId === appId);
-        if (followedGame && followedGame.lastUpdateTimestamp) {
-          lastUpdateTimestamp = followedGame.lastUpdateTimestamp;
-        }
-      }
-
-      return {
-        appId,
-        name: game.name,
-        logoUrl: game.img_logo_url
-          ? `http://media.steampowered.com/steamcommunity/public/images/apps/${game.appid}/${game.img_logo_url}.jpg`
-          : null,
-        iconUrl: game.img_icon_url
-          ? `http://media.steampowered.com/steamcommunity/public/images/apps/${game.appid}/${game.img_icon_url}.jpg`
-          : null,
-        playtime: {
-          forever: game.playtime_forever || 0,
-          recent: game.playtime_2weeks || 0,
-        },
-        lastUpdateTimestamp,
-      };
+    // Si l'utilisateur n'a pas de jeux suivis, retourner simplement la liste des jeux
+    return res.json({
+      status: "success",
+      games,
+      totalGames: games.length,
+      storedGamesCount: user ? user.ownedGames.length : 0,
+      apiResponse: games.length,
     });
-
-    res.json(formattedGames);
   } catch (error) {
     console.error("Erreur lors de la récupération des jeux:", error);
-    res.status(500).json({ message: "Erreur serveur" });
+    return res.status(500).json({
+      status: "error",
+      message: "Erreur lors de la récupération des jeux",
+      error: error.message,
+    });
+  }
+});
+
+// Route pour récupérer les actualités d'un jeu
+router.get("/news/:appId", async (req, res) => {
+  const { appId } = req.params;
+  const { count, maxLength, language, steamOnly } = req.query;
+
+  try {
+    // Vérifier que l'appId est valide
+    if (!appId || isNaN(parseInt(appId))) {
+      return res.status(400).json({
+        status: "error",
+        message: "AppID invalide",
+      });
+    }
+
+    // Récupérer les actualités
+    const news = await steamService.getGameNews(
+      appId,
+      count ? parseInt(count) : 5,
+      maxLength ? parseInt(maxLength) : 300,
+      language || "fr",
+      steamOnly === "true"
+    );
+
+    return res.json({
+      status: "success",
+      news,
+      count: news.length,
+    });
+  } catch (error) {
+    console.error("Erreur lors de la récupération des actualités:", error);
+    return res.status(500).json({
+      status: "error",
+      message: "Erreur lors de la récupération des actualités",
+      error: error.message,
+    });
   }
 });
 
@@ -235,6 +195,220 @@ router.get("/profile/:steamId", async (req, res) => {
   } catch (error) {
     console.error("Erreur lors de la récupération du profil:", error);
     res.status(500).json({ message: "Erreur serveur" });
+  }
+});
+
+// Route pour récupérer la liste complète des jeux d'un utilisateur (API + Base de données)
+router.get("/all-games/:steamId", async (req, res) => {
+  const { steamId } = req.params;
+
+  try {
+    console.log(
+      `Demande de liste complète de jeux pour l'utilisateur ${steamId}`
+    );
+
+    // Vérifier que le steamId est valide
+    if (!steamId || steamId.length < 5) {
+      return res.status(400).json({
+        status: "error",
+        message: "SteamID invalide",
+      });
+    }
+
+    // Récupérer l'utilisateur
+    const user = await User.findOne({ steamId });
+
+    if (!user) {
+      return res.status(404).json({
+        status: "error",
+        message: "Utilisateur non trouvé",
+      });
+    }
+
+    console.log(
+      `Utilisateur ${user.username} trouvé, possède ${user.ownedGames.length} jeux en base`
+    );
+
+    // Récupérer la liste des jeux depuis l'API Steam (tentative)
+    console.log(`Récupération des jeux depuis l'API Steam pour ${steamId}`);
+    let apiGames = [];
+    try {
+      apiGames = await steamService.getUserGames(steamId);
+      console.log(
+        `API Steam a retourné ${apiGames.length} jeux pour ${steamId}`
+      );
+    } catch (apiError) {
+      console.error(
+        `Erreur lors de la récupération des jeux via l'API:`,
+        apiError
+      );
+      console.log(`Utilisation uniquement des jeux en base de données`);
+    }
+
+    // Créer un Map des jeux de l'API pour une recherche rapide
+    const apiGamesMap = new Map();
+    apiGames.forEach((game) => {
+      apiGamesMap.set(game.appid.toString(), game);
+    });
+
+    // Créer un Map des jeux suivis pour un accès rapide
+    const followedGamesMap = new Map();
+    if (user.followedGames) {
+      user.followedGames.forEach((followedGame) => {
+        followedGamesMap.set(followedGame.appId, followedGame);
+      });
+    }
+
+    // Préparer la liste complète des jeux
+    const completeGames = [];
+
+    // Ajouter d'abord tous les jeux de l'API (ils ont toutes les infos)
+    apiGames.forEach((game) => {
+      const appId = game.appid.toString();
+      const followedGame = followedGamesMap.get(appId);
+
+      completeGames.push({
+        ...game,
+        isFollowed: !!followedGame,
+        lastNewsTimestamp: followedGame
+          ? followedGame.lastNewsTimestamp || 0
+          : 0,
+        lastUpdateTimestamp: followedGame
+          ? followedGame.lastUpdateTimestamp || 0
+          : 0,
+        source: "api",
+      });
+    });
+
+    // Ajouter les jeux qui sont uniquement dans la base de données
+    for (const dbGame of user.ownedGames) {
+      const appId = dbGame.appId;
+
+      // Vérifier si ce jeu existe déjà dans la liste (via l'API)
+      if (!apiGamesMap.has(appId)) {
+        // Ce jeu n'est pas dans la liste de l'API, l'ajouter depuis la DB
+        const followedGame = followedGamesMap.get(appId);
+
+        const gameData = {
+          appid: parseInt(appId),
+          name: followedGame ? followedGame.name : `Jeu #${appId}`,
+          img_logo_url: followedGame ? followedGame.logoUrl : null,
+          isFollowed: !!followedGame,
+          lastNewsTimestamp: followedGame
+            ? followedGame.lastNewsTimestamp || 0
+            : 0,
+          lastUpdateTimestamp: followedGame
+            ? followedGame.lastUpdateTimestamp || 0
+            : 0,
+          source: "database",
+          addedAt: dbGame.addedAt,
+        };
+
+        completeGames.push(gameData);
+      }
+    }
+
+    console.log(
+      `Liste complète générée avec ${completeGames.length} jeux (${
+        apiGames.length
+      } de l'API, ${
+        completeGames.length - apiGames.length
+      } de la base de données uniquement)`
+    );
+
+    return res.json({
+      status: "success",
+      games: completeGames,
+      totalGames: completeGames.length,
+      apiGamesCount: apiGames.length,
+      databaseOnlyCount: completeGames.length - apiGames.length,
+      storedGamesCount: user.ownedGames.length,
+    });
+  } catch (error) {
+    console.error("Erreur lors de la récupération des jeux:", error);
+    return res.status(500).json({
+      status: "error",
+      message: "Erreur lors de la récupération des jeux",
+      error: error.message,
+    });
+  }
+});
+
+// Route de diagnostic pour vérifier la bibliothèque complète d'un utilisateur
+router.get("/diagnostic/library/:steamId", async (req, res) => {
+  const { steamId } = req.params;
+
+  try {
+    console.log(
+      `[DIAGNOSTIC] Démarrage du diagnostic complet pour l'utilisateur ${steamId}`
+    );
+
+    // 1. Vérifier combien de jeux sont dans la base de données
+    const user = await User.findOne({ steamId });
+    const dbGamesCount = user ? user.ownedGames.length : 0;
+    console.log(
+      `[DIAGNOSTIC] Nombre de jeux dans la base de données: ${dbGamesCount}`
+    );
+
+    // 2. Récupérer les jeux via l'API Steam
+    console.log(`[DIAGNOSTIC] Récupération des jeux via l'API Steam...`);
+    const steamApiGames = await steamService.getUserGames(steamId);
+    console.log(
+      `[DIAGNOSTIC] Nombre de jeux récupérés via l'API Steam: ${steamApiGames.length}`
+    );
+
+    // 3. Vérifier les compteurs dans la réponse de l'API
+    const apiResponseGameCount =
+      steamApiGames.response?.game_count || "Non disponible";
+    console.log(
+      `[DIAGNOSTIC] Compteur de jeux dans la réponse de l'API: ${apiResponseGameCount}`
+    );
+
+    // 4. Essayer de vérifier via le profil web Steam (méthode alternative)
+    const webProfileCheck = await steamService.checkSteamProfileGamesCount(
+      steamId
+    );
+    const webProfileGamesCount = webProfileCheck.success
+      ? webProfileCheck.estimatedCount
+      : "Échec de l'estimation";
+    console.log(
+      `[DIAGNOSTIC] Estimation du nombre de jeux via le profil web: ${webProfileGamesCount}`
+    );
+
+    // 5. Vérifier si des jeux ont déjà été synchronisés
+    const syncedGamesCount =
+      user && user.lastSyncedGames ? user.lastSyncedGames.length : 0;
+    console.log(
+      `[DIAGNOSTIC] Nombre de jeux synchronisés précédemment: ${syncedGamesCount}`
+    );
+
+    // Réponse avec toutes les informations recueillies
+    return res.json({
+      status: "success",
+      diagnosticResults: {
+        userId: steamId,
+        username: user ? user.username : "Utilisateur non trouvé",
+        databaseGamesCount: dbGamesCount,
+        apiGamesCount: steamApiGames.length,
+        apiResponseGameCount,
+        webProfileGamesCount,
+        syncedGamesCount,
+        lastChecked: user ? user.lastChecked : null,
+        createdAt: user ? user.createdAt : null,
+        discrepancyDetected:
+          steamApiGames.length !== dbGamesCount ||
+          (webProfileCheck.success &&
+            webProfileCheck.estimatedCount > dbGamesCount),
+      },
+      recommendations: [],
+    });
+  } catch (error) {
+    console.error(`[DIAGNOSTIC] Erreur lors du diagnostic: ${error.message}`);
+    return res.status(500).json({
+      status: "error",
+      message: "Erreur lors du diagnostic de la bibliothèque",
+      error: error.message,
+    });
   }
 });
 

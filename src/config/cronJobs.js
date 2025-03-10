@@ -22,6 +22,19 @@ function initCronJobs() {
     }
   });
 
+  // Vérification des nouveaux jeux toutes les 10 minutes
+  cron.schedule("0 */10 * * * *", async () => {
+    console.log(
+      "Exécution de la tâche planifiée: vérification des nouveaux jeux"
+    );
+    try {
+      const stats = await gamesSyncService.checkNewGamesForAllUsers();
+      console.log("Statistiques de vérification des nouveaux jeux:", stats);
+    } catch (error) {
+      console.error("Erreur lors de la vérification des nouveaux jeux:", error);
+    }
+  });
+
   // Synchronisation des bibliothèques - approche par groupes
   // Nous divisons les utilisateurs en 12 groupes et synchronisons un groupe différent chaque heure
   // Chaque utilisateur est ainsi synchronisé toutes les 12 heures

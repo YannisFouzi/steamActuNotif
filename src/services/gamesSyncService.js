@@ -1,5 +1,7 @@
 const User = require("../models/User");
+const Game = require("../models/Game");
 const steamService = require("./steamService");
+const notificationService = require("./notificationService");
 
 /**
  * Synchronise les jeux de tous les utilisateurs enregistrés
@@ -50,6 +52,293 @@ async function syncAllUsersGames() {
       error
     );
     throw error;
+  }
+}
+
+/**
+ * Vérifie toutes les 10 minutes si de nouveaux jeux ont été achetés
+ * @returns {Promise<Object>} Statistiques de vérification
+ */
+async function checkNewGamesForAllUsers() {
+  console.log("Vérification des nouveaux jeux pour tous les utilisateurs...");
+  const stats = {
+    totalUsers: 0,
+    usersProcessed: 0,
+    usersWithNewGames: 0,
+    totalNewGames: 0,
+    errors: 0,
+  };
+
+  try {
+    // Récupérer tous les utilisateurs
+    const users = await User.find({});
+    stats.totalUsers = users.length;
+
+    // Pour chaque utilisateur
+    for (const user of users) {
+      try {
+        stats.usersProcessed++;
+        const result = await checkNewGamesForUser(user);
+
+        if (result.newGames.length > 0) {
+          stats.usersWithNewGames++;
+          stats.totalNewGames += result.newGames.length;
+
+          // Marquer ces jeux comme en attente pour l'utilisateur
+          await addGamesToPending(user._id, result.newGames);
+
+          // Si l'option de suivre automatiquement est activée, suivre ces nouveaux jeux
+          if (
+            user.notificationSettings &&
+            user.notificationSettings.autoFollowNewGames
+          ) {
+            await autoFollowNewGames(user._id, result.newGames);
+          }
+        }
+      } catch (error) {
+        console.error(
+          `Erreur lors de la vérification des nouveaux jeux pour l'utilisateur ${user.username}:`,
+          error
+        );
+        stats.errors++;
+      }
+    }
+
+    console.log("Vérification des nouveaux jeux terminée:", stats);
+    return stats;
+  } catch (error) {
+    console.error("Erreur lors de la vérification des nouveaux jeux:", error);
+    throw error;
+  }
+}
+
+/**
+ * Vérifie si un utilisateur a acheté de nouveaux jeux
+ * @param {Object} user - L'utilisateur à vérifier
+ * @returns {Promise<Object>} Résultat avec les nouveaux jeux détectés
+ */
+async function checkNewGamesForUser(user) {
+  const result = {
+    userId: user._id,
+    steamId: user.steamId,
+    username: user.username,
+    newGames: [],
+    error: null,
+  };
+
+  try {
+    console.log(
+      `Vérification des nouveaux jeux pour ${user.username} (${user.steamId})`
+    );
+
+    // Récupérer la liste actuelle des jeux
+    const userGames = await steamService.getUserGames(user.steamId);
+
+    if (!userGames || !Array.isArray(userGames)) {
+      console.error(`Réponse invalide de l'API Steam pour ${user.username}`);
+      result.error = "Réponse invalide de l'API Steam";
+      return result;
+    }
+
+    // Créer un ensemble d'IDs de jeux possédés
+    const ownedGameIds = new Set();
+    if (user.ownedGames && Array.isArray(user.ownedGames)) {
+      user.ownedGames.forEach((game) => ownedGameIds.add(game.appId));
+    }
+
+    // Vérifier les nouveaux jeux
+    for (const game of userGames) {
+      const appId = game.appid.toString();
+
+      // Si ce jeu n'est pas dans la liste des jeux possédés, c'est un nouveau jeu
+      if (!ownedGameIds.has(appId)) {
+        console.log(
+          `Nouveau jeu détecté pour ${user.username}: ${game.name} (${appId})`
+        );
+
+        // Ajouter à la liste des nouveaux jeux détectés
+        result.newGames.push({
+          appId,
+          name: game.name,
+          logoUrl: game.img_logo_url
+            ? `http://media.steampowered.com/steamcommunity/public/images/apps/${game.appid}/${game.img_logo_url}.jpg`
+            : null,
+        });
+
+        // Ajouter à la liste des jeux possédés
+        await User.updateOne(
+          { _id: user._id },
+          {
+            $push: {
+              ownedGames: {
+                appId,
+                addedAt: new Date(),
+              },
+            },
+          }
+        );
+      }
+    }
+
+    return result;
+  } catch (error) {
+    console.error(
+      `Erreur lors de la vérification pour ${user.username}:`,
+      error
+    );
+    result.error = error.message;
+    return result;
+  }
+}
+
+/**
+ * Ajoute des jeux à la liste d'attente de l'utilisateur
+ * @param {string} userId - ID de l'utilisateur
+ * @param {Array} games - Liste des jeux à ajouter
+ */
+async function addGamesToPending(userId, games) {
+  if (!games || games.length === 0) return;
+
+  const pendingGames = games.map((game) => ({
+    appId: game.appId,
+    name: game.name,
+    logoUrl: game.logoUrl,
+    detectedAt: new Date(),
+  }));
+
+  await User.updateOne(
+    { _id: userId },
+    { $push: { pendingNewGames: { $each: pendingGames } } }
+  );
+
+  console.log(
+    `${games.length} jeux ajoutés à la liste d'attente pour l'utilisateur ${userId}`
+  );
+}
+
+/**
+ * Suit automatiquement les nouveaux jeux pour un utilisateur
+ * @param {string} userId - ID de l'utilisateur
+ * @param {Array} games - Liste des jeux à suivre
+ */
+async function autoFollowNewGames(userId, games) {
+  if (!games || games.length === 0) return;
+
+  const user = await User.findById(userId);
+  if (!user) {
+    console.error(`Utilisateur non trouvé: ${userId}`);
+    return;
+  }
+
+  for (const game of games) {
+    // Vérifier si le jeu existe déjà dans la base de données centrale
+    let gameDoc = await Game.findOne({ appId: game.appId });
+
+    // Si le jeu n'existe pas encore, le créer
+    if (!gameDoc) {
+      gameDoc = new Game({
+        appId: game.appId,
+        name: game.name,
+        logoUrl: game.logoUrl,
+        lastNewsTimestamp: 0,
+        lastUpdateTimestamp: Date.now(),
+        followers: [userId],
+      });
+      await gameDoc.save();
+    } else {
+      // Sinon, ajouter l'utilisateur comme follower s'il ne l'est pas déjà
+      if (!gameDoc.followers.includes(userId)) {
+        gameDoc.followers.push(userId);
+        await gameDoc.save();
+      }
+    }
+
+    // Ajouter le jeu à la liste des jeux suivis par l'utilisateur
+    const isAlreadyFollowing = user.followedGames.some(
+      (g) => g.appId === game.appId
+    );
+
+    if (!isAlreadyFollowing) {
+      user.followedGames.push({
+        appId: game.appId,
+        name: game.name,
+        logoUrl: game.logoUrl,
+        lastNewsTimestamp: 0,
+        lastUpdateTimestamp: Date.now(),
+      });
+    }
+  }
+
+  // Sauvegarder les changements
+  await user.save();
+  console.log(
+    `${games.length} nouveaux jeux suivis automatiquement pour l'utilisateur ${user.username}`
+  );
+}
+
+/**
+ * Récupère et synchronise les jeux en attente pour un utilisateur
+ * @param {string} userId - ID de l'utilisateur
+ * @returns {Promise<Object>} Résultat avec les jeux synchronisés
+ */
+async function syncPendingGamesForUser(userId) {
+  const result = {
+    userId,
+    pendingGames: [],
+    processedGames: [],
+    error: null,
+  };
+
+  try {
+    const user = await User.findById(userId);
+    if (!user) {
+      result.error = "Utilisateur non trouvé";
+      return result;
+    }
+
+    // Si aucun jeu en attente, retourner directement
+    if (!user.pendingNewGames || user.pendingNewGames.length === 0) {
+      return result;
+    }
+
+    // Copier les jeux en attente pour le résultat
+    result.pendingGames = [...user.pendingNewGames];
+
+    // Pour chaque jeu en attente, récupérer des informations complètes
+    for (const game of user.pendingNewGames) {
+      try {
+        // Ici, vous pourriez faire un appel à l'API Steam pour obtenir plus d'informations sur le jeu
+        // Comme les détails, la description, etc.
+
+        result.processedGames.push({
+          appId: game.appId,
+          name: game.name,
+          logoUrl: game.logoUrl,
+          detectedAt: game.detectedAt,
+        });
+      } catch (error) {
+        console.error(
+          `Erreur lors de la synchronisation du jeu ${game.appId}:`,
+          error
+        );
+      }
+    }
+
+    // Vider la liste des jeux en attente
+    user.pendingNewGames = [];
+    await user.save();
+
+    console.log(
+      `${result.processedGames.length} jeux en attente synchronisés pour ${user.username}`
+    );
+    return result;
+  } catch (error) {
+    console.error(
+      `Erreur lors de la synchronisation des jeux en attente:`,
+      error
+    );
+    result.error = error.message;
+    return result;
   }
 }
 
@@ -323,6 +612,9 @@ async function syncUserGames(user) {
 
 module.exports = {
   syncAllUsersGames,
-  syncUserGames,
   syncUserGroupByIndex,
+  syncUserGames,
+  checkNewGamesForAllUsers,
+  checkNewGamesForUser,
+  syncPendingGamesForUser,
 };

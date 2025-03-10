@@ -40,6 +40,36 @@ const UserSchema = new mongoose.Schema({
       },
     },
   ],
+  ownedGames: [
+    {
+      appId: {
+        type: String,
+        required: true,
+      },
+      addedAt: {
+        type: Date,
+        default: Date.now,
+      },
+    },
+  ],
+  pendingNewGames: [
+    {
+      appId: {
+        type: String,
+        required: true,
+      },
+      name: {
+        type: String,
+      },
+      logoUrl: {
+        type: String,
+      },
+      detectedAt: {
+        type: Date,
+        default: Date.now,
+      },
+    },
+  ],
   notificationSettings: {
     enabled: {
       type: Boolean,
